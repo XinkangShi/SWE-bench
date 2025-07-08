@@ -42,6 +42,7 @@ MODEL_LIMITS = {
     "gpt-4-0613": 8_192,
     "gpt-4-1106-preview": 128_000,
     "gpt-4-0125-preview": 128_000,
+    "qwen2.5-coder-32b-instruct": 131_072,  # 128K context window
 }
 
 # The cost per token for each model input.
@@ -61,6 +62,7 @@ MODEL_COST_PER_INPUT = {
     "gpt-4-32k": 0.00006,
     "gpt-4-1106-preview": 0.00001,
     "gpt-4-0125-preview": 0.00001,
+    "qwen2.5-coder-32b-instruct": 0.000002,  # 估计成本
 }
 
 # The cost per token for each model output.
@@ -80,6 +82,7 @@ MODEL_COST_PER_OUTPUT = {
     "gpt-4-32k": 0.00012,
     "gpt-4-1106-preview": 0.00003,
     "gpt-4-0125-preview": 0.00003,
+    "qwen2.5-coder-32b-instruct": 0.000006,  # 估计成本
 }
 
 # used for azure
@@ -108,6 +111,138 @@ def calc_cost(model_name, input_tokens, output_tokens):
         f"input_tokens={input_tokens}, output_tokens={output_tokens}, cost={cost:.2f}"
     )
     return cost
+
+
+def qwen_tokenize(string: str) -> int:
+    """
+    简单的token估算函数，用于Qwen模型
+    实际应用中建议使用官方tokenizer
+    """
+    # 简单估算：中文字符按1.5倍计算，英文单词平均4个字符
+    chinese_chars = len([c for c in string if '\u4e00' <= c <= '\u9fff'])
+    total_chars = len(string)
+    english_chars = total_chars - chinese_chars
+    
+    # 粗略估算token数量
+    estimated_tokens = int(chinese_chars * 1.5 + english_chars / 4)
+    return max(estimated_tokens, total_chars // 4)  # 保底估算
+
+
+@retry(wait=wait_random_exponential(min=30, max=600), stop=stop_after_attempt(3))
+def call_qwen_api(inputs, model_name_or_path, temperature, top_p, **model_args):
+    """
+    调用Qwen OpenAI兼容API生成补丁
+    
+    支持所有OpenAI兼容的API提供商：
+    - vLLM
+    - TGI (Text Generation Inference)
+    - Ollama
+    - 其他OpenAI兼容服务
+    """
+    base_url = model_args.get("base_url", "http://localhost:8000/v1")
+    api_key = model_args.get("api_key", "dummy")
+    
+    client = openai.OpenAI(
+        base_url=base_url,
+        api_key=api_key
+    )
+    
+    system_message = inputs.split("\n", 1)[0] if "\n" in inputs else ""
+    user_message = inputs.split("\n", 1)[1] if "\n" in inputs else inputs
+    
+    try:
+        response = client.chat.completions.create(
+            model="qwen2.5-coder-32b-instruct",
+            messages=[
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=4096
+        )
+        
+        completion = response.choices[0].message.content
+        input_tokens = response.usage.prompt_tokens if response.usage else qwen_tokenize(inputs)
+        output_tokens = response.usage.completion_tokens if response.usage else qwen_tokenize(completion)
+        cost = calc_cost(model_name_or_path, input_tokens, output_tokens)
+        
+        return completion, cost
+        
+    except Exception as e:
+        logger.error(f"Qwen OpenAI兼容API调用失败: {e}")
+        raise e
+
+
+def qwen_inference(
+    test_dataset,
+    model_name_or_path,
+    output_file,
+    model_args,
+    existing_ids,
+    max_cost,
+):
+    """
+    使用Qwen OpenAI兼容API运行推理
+    
+    Args:
+    test_dataset (datasets.Dataset): 要运行推理的数据集
+    model_name_or_path (str): 模型名称或路径
+    output_file (str): 输出文件路径
+    model_args (dict): 模型参数字典（包含base_url, api_key等）
+    existing_ids (set): 已处理的ID集合
+    max_cost (float): 最大推理成本
+    """
+    # 过滤超长文本
+    test_dataset = test_dataset.filter(
+        lambda x: qwen_tokenize(x["text"]) <= MODEL_LIMITS[model_name_or_path],
+        desc="过滤超长文本",
+        load_from_cache_file=False,
+    )
+    
+    temperature = model_args.pop("temperature", 0.1)  # Qwen推荐较低温度
+    top_p = model_args.pop("top_p", 0.95 if temperature > 0 else 1)
+    print(f"使用温度={temperature}, top_p={top_p}")
+    
+    basic_args = {
+        "model_name_or_path": model_name_or_path,
+    }
+    total_cost = 0
+    print(f"过滤后剩余 {len(test_dataset)} 个实例")
+    
+    with open(output_file, "a+") as f:
+        for datum in tqdm(test_dataset, desc=f"Qwen推理: {model_name_or_path}"):
+            instance_id = datum["instance_id"]
+            if instance_id in existing_ids:
+                continue
+                
+            output_dict = {"instance_id": instance_id}
+            output_dict.update(basic_args)
+            output_dict["text"] = f"{datum['text']}\n\n"
+            
+            try:
+                completion, cost = call_qwen_api(
+                    output_dict["text"],
+                    model_name_or_path,
+                    temperature,
+                    top_p,
+                    **model_args
+                )
+                total_cost += cost
+                print(f"总成本: {total_cost:.4f}")
+                
+                output_dict["full_output"] = completion
+                output_dict["model_patch"] = extract_diff(completion)
+                print(json.dumps(output_dict, ensure_ascii=False), file=f, flush=True)
+                
+                if max_cost is not None and total_cost >= max_cost:
+                    print(f"达到最大成本 {max_cost}，退出")
+                    break
+                    
+            except Exception as e:
+                logger.error(f"处理实例 {instance_id} 时出错: {e}")
+                traceback.print_exc()
+                continue
 
 
 @retry(wait=wait_random_exponential(min=30, max=600), stop=stop_after_attempt(3))
@@ -499,13 +634,17 @@ def main(
         "existing_ids": existing_ids,
         "max_cost": max_cost,
     }
+    
+    # 根据模型名称选择推理函数
     if model_name_or_path.startswith("claude"):
         anthropic_inference(**inference_args)
     elif model_name_or_path.startswith("gpt"):
         openai_inference(**inference_args)
+    elif "qwen" in model_name_or_path.lower():
+        qwen_inference(**inference_args)
     else:
-        raise ValueError(f"Invalid model name or path {model_name_or_path}")
-    logger.info("Done!")
+        raise ValueError(f"不支持的模型名称: {model_name_or_path}")
+    logger.info("推理完成!")
 
 
 if __name__ == "__main__":
@@ -551,7 +690,7 @@ if __name__ == "__main__":
         "--model_args",
         type=str,
         default=None,
-        help="List of model arguments separated by commas. (e.g. 'top_p=0.95,temperature=0.70')",
+        help="List of model arguments separated by commas. (e.g. 'top_p=0.95,temperature=0.70,base_url=http://localhost:8000/v1,api_key=dummy')",
     )
     parser.add_argument(
         "--max_cost",
