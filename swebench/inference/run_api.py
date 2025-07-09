@@ -43,6 +43,7 @@ MODEL_LIMITS = {
     "gpt-4-1106-preview": 128_000,
     "gpt-4-0125-preview": 128_000,
     "qwen2.5-coder-32b-instruct": 131_072,  # 128K context window
+    "qwen2.5-coder-7b-instruct": 131_072,   # 128K context window
 }
 
 # The cost per token for each model input.
@@ -63,6 +64,7 @@ MODEL_COST_PER_INPUT = {
     "gpt-4-1106-preview": 0.00001,
     "gpt-4-0125-preview": 0.00001,
     "qwen2.5-coder-32b-instruct": 0.000002,  # 估计成本
+    "qwen2.5-coder-7b-instruct": 0.000001,   # 估计成本，7B模型通常比32B便宜
 }
 
 # The cost per token for each model output.
@@ -83,6 +85,7 @@ MODEL_COST_PER_OUTPUT = {
     "gpt-4-1106-preview": 0.00003,
     "gpt-4-0125-preview": 0.00003,
     "qwen2.5-coder-32b-instruct": 0.000006,  # 估计成本
+    "qwen2.5-coder-7b-instruct": 0.000002,   # 估计成本，7B模型通常比32B便宜
 }
 
 # used for azure
@@ -139,8 +142,8 @@ def call_qwen_api(inputs, model_name_or_path, temperature, top_p, **model_args):
     - Ollama
     - 其他OpenAI兼容服务
     """
-    base_url = model_args.get("base_url", "http://localhost:8000/v1")
-    api_key = model_args.get("api_key", "dummy")
+    base_url = model_args.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+    api_key = model_args.get("api_key", "sk-bd34df64396e465dbe723c1751c2f357")
     
     client = openai.OpenAI(
         base_url=base_url,
@@ -152,7 +155,7 @@ def call_qwen_api(inputs, model_name_or_path, temperature, top_p, **model_args):
     
     try:
         response = client.chat.completions.create(
-            model="qwen2.5-coder-32b-instruct",
+            model=model_name_or_path,
             messages=[
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": user_message}
@@ -608,6 +611,15 @@ def main(
                 data = json.loads(line)
                 instance_id = data["instance_id"]
                 existing_ids.add(instance_id)
+             
+    maxlen = set()
+    if os.path.exists("instance_ids_maxlen_8000.jsonl"):
+        with open("instance_ids_maxlen_8000.jsonl") as f:
+            for line in f:
+                data = json.loads(line)
+                instance_id = data["instance_id"]
+                maxlen.add(instance_id)
+                                                 
     logger.info(f"Read {len(existing_ids)} already completed ids from {output_file}")
     if Path(dataset_name_or_path).exists():
         dataset = load_from_disk(dataset_name_or_path)
@@ -624,6 +636,14 @@ def main(
             desc="Filtering out existing ids",
             load_from_cache_file=False,
         )
+
+    if len(maxlen) > 0:
+        dataset = dataset.filter(
+            lambda x: x["instance_id"] in maxlen,
+            desc="Filtering out maxlen ids",
+            load_from_cache_file=False,
+        )
+        
     if shard_id is not None and num_shards is not None:
         dataset = dataset.shard(num_shards, shard_id, contiguous=True)
     inference_args = {
